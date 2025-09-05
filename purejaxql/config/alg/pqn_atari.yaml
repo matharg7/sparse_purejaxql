@@ -24,6 +24,17 @@ ENV_KWARGS:
   frame_skip: 4
   noop_max: 30
 
+# add jaxpruner config here
+# TODO: add start and end ratios instead of steps
+PRUNER_KWARGS: 
+  pruner: "magnitude"
+  sparsity: 0.95
+  update_frequency: 1500
+  start_step: 157500 
+  end_step: 624000 
+  sparsity_distribution: "erk"
+  drop_fraction: 0.3
+
 # evaluation
 TEST_DURING_TRAINING: True 
 TEST_ENVS: 8
