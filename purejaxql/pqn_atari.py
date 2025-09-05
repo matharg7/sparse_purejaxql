@@ -18,9 +18,12 @@ from flax.training.train_state import TrainState
 import hydra
 from omegaconf import OmegaConf
 import wandb
-
+import jaxpruner
+from jaxpruner import api
+from jaxpruner import utils
 import envpool
-
+import ml_collections
+from functools import partial
 from purejaxql.utils.atari_wrapper import JaxLogEnvPoolWrapper
 
 
@@ -111,11 +114,15 @@ def make_train(config):
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
-
+    # How many full outer iterations can I run if I want exactly 
+    # B = NUM_ENVS * NUM_STEPS transitions per update?” This is similar to constructing the entire Dataset
+    
     config["NUM_UPDATES_DECAY"] = (
         config["TOTAL_TIMESTEPS_DECAY"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
-
+    # Same idea but for schedules (ε / LR). 
+    # You often want the decay horizon to be decoupled from the total training budget:
+    
     assert (config["NUM_STEPS"] * config["NUM_ENVS"]) % config[
         "NUM_MINIBATCHES"
     ] == 0, "NUM_MINIBATCHES must divide NUM_STEPS*NUM_ENVS"
@@ -140,7 +147,7 @@ def make_train(config):
         if config.get("TEST_DURING_TRAINING", False)
         else config["NUM_ENVS"]
     )
-    env = make_env(total_envs)
+    env = make_env(total_envs) # create all envs at once (test + train)
 
     # epsilon-greedy exploration
     def eps_greedy_exploration(rng, q_vals, eps):
@@ -188,13 +195,21 @@ def make_train(config):
         )
 
         def create_agent(rng):
+            rng, rng_sparse = jax.random.split(rng, 2)
             init_x = jnp.zeros((1, *env.single_observation_space.shape))
             network_variables = network.init(rng, init_x, train=False)
-
+            # TODO: Add updater from jaxpruner
+            sparse_config = create_jaxpruner_config(config)
+            sparse_config.rng_seed = rng_sparse
+            pruner = api.create_updater_from_config(
+                sparse_config
+            )
             tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
                 optax.radam(learning_rate=lr),
             )
+            post_op = jax.jit(pruner.post_gradient_update)
+            tx = pruner.wrap_optax(tx)
 
             train_state = CustomTrainState.create(
                 apply_fn=network.apply,
@@ -202,20 +217,21 @@ def make_train(config):
                 batch_stats=network_variables["batch_stats"],
                 tx=tx,
             )
-            return train_state
+            return train_state, post_op
 
         rng, _rng = jax.random.split(rng)
-        train_state = create_agent(rng)
+        train_state, post_op = create_agent(rng)
 
         # TRAINING LOOP
         def _update_step(runner_state, unused):
 
             train_state, expl_state, test_metrics, rng = runner_state
 
-            # SAMPLE PHASE
+            # SAMPLE PHASE: This runs one env step for all parallel envs and returns the transition at that step.
             def _step_env(carry, _):
                 last_obs, env_state, rng = carry
                 rng, rng_a, rng_s = jax.random.split(rng, 3)
+                # TODO: Add post gradient update on params 
                 q_vals = network.apply(
                     {
                         "params": train_state.params,
@@ -336,10 +352,13 @@ def make_train(config):
                         _loss_fn, has_aux=True
                     )(train_state.params)
                     train_state = train_state.apply_gradients(grads=grads)
+                    post_params = post_op(train_state.params, train_state.opt_state)
                     train_state = train_state.replace(
+                        params=post_params,
                         grad_steps=train_state.grad_steps + 1,
                         batch_stats=updates["batch_stats"],
                     )
+                    
                     return (train_state, rng), (loss, qvals)
 
                 def preprocess_transition(x, rng):
@@ -364,6 +383,7 @@ def make_train(config):
                 (train_state, rng), (loss, qvals) = jax.lax.scan(
                     _learn_phase, (train_state, rng), (minibatches, targets)
                 )
+                
 
                 return (train_state, rng), (loss, qvals)
 
@@ -371,7 +391,8 @@ def make_train(config):
             (train_state, rng), (loss, qvals) = jax.lax.scan(
                 _learn_epoch, (train_state, rng), None, config["NUM_EPOCHS"]
             )
-
+            post_params = post_op(train_state.params, train_state.opt_state)
+            train_state = train_state.replace(params=post_params)
             train_state = train_state.replace(n_updates=train_state.n_updates + 1)
 
             if config.get("TEST_DURING_TRAINING", False):
@@ -379,6 +400,10 @@ def make_train(config):
                 infos = jax.tree_util.tree_map(lambda x: x[:, : -config["TEST_ENVS"]], infos)
                 infos.update({"test/" + k: v for k, v in test_infos.items()})
 
+            # Added logging for differnt analysis metrics.
+            param_sparsity = utils.summarize_sparsity(train_state.params, only_total_sparsity=True)
+            mask_sparsity = utils.summarize_sparsity(train_state.opt_state.masks, only_total_sparsity=True)
+            
             metrics = {
                 "env_step": train_state.timesteps,
                 "update_steps": train_state.n_updates,
@@ -389,7 +414,10 @@ def make_train(config):
                 "grad_steps": train_state.grad_steps,
                 "td_loss": loss.mean(),
                 "qvals": qvals.mean(),
+                "param_sparsity": param_sparsity['_total_sparsity'],
+                "mask_sparsity": mask_sparsity['_total_sparsity'],
             }
+            
 
             metrics.update({k: v.mean() for k, v in infos.items()})
             if config.get("TEST_DURING_TRAINING", False):
@@ -446,7 +474,7 @@ def single_run(config):
             env_name.upper(),
             f"jax_{jax.__version__}",
         ],
-        name=f'{config["ALG_NAME"]}_{config["ENV_NAME"]}',
+        name=f'{config["ALG_NAME"]}_{config["ENV_NAME"]}', # TODO: add jaxpruner info to run name as well
         config=config,
         mode=config["WANDB_MODE"],
     )
@@ -455,12 +483,12 @@ def single_run(config):
 
     t0 = time.time()
     if config["NUM_SEEDS"] > 1:
-        raise NotImplementedError("Vmapped seeds not supported yet.")
+        raise NotImplementedError("Vmapped seeds not supported yet.") # can't do parallel seeds yet
     else:
         outs = jax.jit(make_train(config))(rng)
     print(f"Took {time.time()-t0} seconds to complete.")
 
-    # save params
+    # save params < -----------------------------
     if config.get("SAVE_PATH", None) is not None:
 
         from purejaxql.utils.save_load import save_params
@@ -533,11 +561,21 @@ def tune(default_config):
 def main(config):
     config = OmegaConf.to_container(config)
     print("Config:\n", OmegaConf.to_yaml(config))
-    if config["HYP_TUNE"]:
+    if config["HYP_TUNE"]: # could be used for differnt seeds too
         tune(config)
     else:
         single_run(config)
 
+def create_jaxpruner_config(config):
+    jaxpruner_config = ml_collections.ConfigDict()
+    jaxpruner_config.algorithm = config["PRUNER_KWARGS"]["pruner"]
+    jaxpruner_config.sparsity = config["PRUNER_KWARGS"]["sparsity"]
+    jaxpruner_config.update_freq = config["PRUNER_KWARGS"]["update_frequency"]
+    jaxpruner_config.update_start_step = config["PRUNER_KWARGS"]["start_step"]
+    jaxpruner_config.update_end_step = config["PRUNER_KWARGS"]["end_step"]
+    jaxpruner_config.dist_type = config["PRUNER_KWARGS"]["sparsity_distribution"]
+    jaxpruner_config.drop_fraction = config["PRUNER_KWARGS"]["drop_fraction"]
+    return jaxpruner_config
 
 if __name__ == "__main__":
-    main()
+    main() # Args are loaded with the config file in side main
