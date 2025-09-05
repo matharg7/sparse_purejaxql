@@ -11,6 +11,6 @@ __pycache__/
 wandb/
 outputs/
 models/
-
+.venv
 **.npz
 **.safetensors
