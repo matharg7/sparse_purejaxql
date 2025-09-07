@@ -73,23 +73,183 @@ class CNN(nn.Module):
         return x
 
 
+# class QNetwork(nn.Module):
+#     action_dim: int
+#     norm_type: str = "layer_norm"
+#     norm_input: bool = False
+
+#     @nn.compact
+#     def __call__(self, x: jnp.ndarray, train: bool):
+#         x = jnp.transpose(x, (0, 2, 3, 1))
+#         if self.norm_input:
+#             x = nn.BatchNorm(use_running_average=not train)(x)
+#         else:
+#             # dummy normalize input for global compatibility
+#             x_dummy = nn.BatchNorm(use_running_average=not train)(x)
+#             x = x / 255.0
+#         x = CNN(norm_type=self.norm_type)(x, train)
+#         x = nn.Dense(self.action_dim)(x)
+#         return x
+
+# --- Dopamine-style IMPALA blocks (Flax) ---
+
+class Stack(nn.Module):
+    """max-pool + two residual conv blocks, like Dopamine's Stack, WITH norm."""
+    num_ch: int
+    num_blocks: int = 2
+    use_max_pooling: bool = True
+    norm_type: str = "layer_norm"  # <--- add
+
+    @nn.compact
+    def __call__(self, x, *, train: bool):
+        init = nn.initializers.xavier_uniform()
+
+        def normalize(y):
+            if self.norm_type == "layer_norm":
+                return nn.LayerNorm()(y)
+            elif self.norm_type == "batch_norm":
+                return nn.BatchNorm(use_running_average=not train)(y)
+            else:
+                return y
+
+        # 3x3 conv then optional 3x3 max-pool stride 2
+        x = nn.Conv(self.num_ch, kernel_size=(3,3), strides=(1,1),
+                    padding="SAME", kernel_init=init)(x)
+        x = normalize(x)                # <--- norm just like your CNN
+        x = nn.relu(x)
+        if self.use_max_pooling:
+            x = nn.max_pool(x, window_shape=(3,3), strides=(2,2), padding="SAME")
+
+        # Two residual blocks: (ReLU -> Conv -> Norm) x2 + skip
+        for _ in range(self.num_blocks):
+            skip = x
+            h = nn.relu(x)
+            h = nn.Conv(self.num_ch, kernel_size=(3,3), strides=(1,1),
+                        padding="SAME", kernel_init=init)(h)
+            h = normalize(h)            # <--- norm
+            h = nn.relu(h)
+            h = nn.Conv(self.num_ch, kernel_size=(3,3), strides=(1,1),
+                        padding="SAME", kernel_init=init)(h)
+            h = normalize(h)            # <--- norm
+            x = skip + h
+        return x
+
+
+
+class ImpalaEncoder(nn.Module):
+    nn_scale: int = 1
+    stack_sizes: tuple = (16, 32, 32)
+    num_blocks: int = 2
+    norm_type: str = "layer_norm"   # <--- add
+
+    def setup(self):
+        self.stacks = [
+            Stack(num_ch=s * self.nn_scale, num_blocks=self.num_blocks, norm_type=self.norm_type)
+            for s in self.stack_sizes
+        ]
+
+    @nn.compact
+    def __call__(self, x, *, train: bool):
+        for s in self.stacks:
+            x = s(x, train=train)
+        return nn.relu(x)
+
+
+
+class ImpalaBackbone(nn.Module):
+    """
+    Full Dopamine-style IMPALA body + dense(512).
+    Matches: xavier_uniform in convs and dense, ReLU, /255.0 preprocessing.
+    """
+    nn_scale: int = 1
+    final_dim: int = 512
+    inputs_preprocessed: bool = False  # False => divide by 255.0 like Dopamine
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, *, train: bool) -> jnp.ndarray:
+        init = nn.initializers.xavier_uniform()
+
+        # Create a no-op BN to keep a batch_stats collection (for your TrainState)
+        if not self.inputs_preprocessed:
+            _ = nn.BatchNorm(use_running_average=not train)(x)  # ignored output
+            x = x.astype(jnp.float32) / 255.0
+        else:
+            x = nn.BatchNorm(use_running_average=not train)(x)
+
+        x = ImpalaEncoder(nn_scale=self.nn_scale)(x, train=train)
+        x = x.reshape((x.shape[0], -1))              # flatten per-batch
+        x = nn.Dense(self.final_dim, kernel_init=init)(x)
+        x = nn.relu(x)
+        return x
+
+
+class ImpalaBackbone(nn.Module):
+    nn_scale: int = 1
+    final_dim: int = 512
+    inputs_preprocessed: bool = False
+    norm_type: str = "layer_norm"   # <--- add
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, *, train: bool) -> jnp.ndarray:
+        init = nn.initializers.xavier_uniform()
+
+        # Keep a BN to ensure batch_stats collection exists regardless of norm_type
+        if not self.inputs_preprocessed:
+            _ = nn.BatchNorm(use_running_average=not train)(x)
+            x = x.astype(jnp.float32) / 255.0
+        else:
+            x = nn.BatchNorm(use_running_average=not train)(x)
+
+        x = ImpalaEncoder(nn_scale=self.nn_scale, norm_type=self.norm_type)(x, train=train)
+        x = x.reshape((x.shape[0], -1))
+        x = nn.Dense(self.final_dim, kernel_init=init)(x)
+
+        # same normalization pattern as your CNN after the dense
+        if self.norm_type == "layer_norm":
+            x = nn.LayerNorm()(x)
+        elif self.norm_type == "batch_norm":
+            x = nn.BatchNorm(use_running_average=not train)(x)
+
+        x = nn.relu(x)
+        return x
+
+
 class QNetwork(nn.Module):
     action_dim: int
     norm_type: str = "layer_norm"
     norm_input: bool = False
 
+    backbone: str = "impala_dopa_exact"
+    impala_scale: int = 1
+    impala_final_dim: int = 512
+    impala_inputs_preprocessed: bool = False
+
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool):
         x = jnp.transpose(x, (0, 2, 3, 1))
+
+        if self.backbone.lower() == "impala_dopa_exact":
+            feats = ImpalaBackbone(
+                nn_scale=self.impala_scale,
+                final_dim=self.impala_final_dim,
+                inputs_preprocessed=self.impala_inputs_preprocessed,
+                norm_type=self.norm_type,                        # <--- pass through
+            )(x, train=train)
+            init = nn.initializers.xavier_uniform()
+            q = nn.Dense(self.action_dim, kernel_init=init)(feats)
+            return q
+
+        # fallback Nature-CNN (unchanged)
         if self.norm_input:
             x = nn.BatchNorm(use_running_average=not train)(x)
         else:
-            # dummy normalize input for global compatibility
-            x_dummy = nn.BatchNorm(use_running_average=not train)(x)
+            _ = nn.BatchNorm(use_running_average=not train)(x)
             x = x / 255.0
-        x = CNN(norm_type=self.norm_type)(x, train)
-        x = nn.Dense(self.action_dim)(x)
-        return x
+        feats = CNN(norm_type=self.norm_type)(x, train)
+        q = nn.Dense(self.action_dim)(feats)
+        return q
+
+
 
 
 @chex.dataclass(frozen=True)
@@ -188,10 +348,19 @@ def make_train(config):
         lr = lr_scheduler if config.get("LR_LINEAR_DECAY", False) else config["LR"]
 
         # INIT NETWORK AND OPTIMIZER
+        # network = QNetwork(
+        #     action_dim=env.single_action_space.n,
+        #     norm_type=config["NORM_TYPE"],
+        #     norm_input=config.get("NORM_INPUT", False),
+        # )
         network = QNetwork(
             action_dim=env.single_action_space.n,
             norm_type=config["NORM_TYPE"],
             norm_input=config.get("NORM_INPUT", False),
+            backbone="impala_dopa_exact",          # <-- add
+            impala_scale=1,                     # <-- add
+            impala_final_dim=512,           # <-- add
+            impala_inputs_preprocessed=False,  # <-- add
         )
 
         def create_agent(rng):
