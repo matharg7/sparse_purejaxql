@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 
 import chex
 import optax
@@ -24,249 +25,17 @@ from jaxpruner import utils
 import envpool
 import ml_collections
 from functools import partial
-from purejaxql.utils.atari_wrapper import JaxLogEnvPoolWrapper
-
-
-class CNN(nn.Module):
-
-    norm_type: str = "layer_norm"
-
-    @nn.compact
-    def __call__(self, x: jnp.ndarray, train: bool):
-        if self.norm_type == "layer_norm":
-            normalize = lambda x: nn.LayerNorm()(x)
-        elif self.norm_type == "batch_norm":
-            normalize = lambda x: nn.BatchNorm(use_running_average=not train)(x)
-        else:
-            normalize = lambda x: x
-        x = nn.Conv(
-            32,
-            kernel_size=(8, 8),
-            strides=(4, 4),
-            padding="VALID",
-            kernel_init=nn.initializers.he_normal(),
-        )(x)
-        x = normalize(x)
-        x = nn.relu(x)
-        x = nn.Conv(
-            64,
-            kernel_size=(4, 4),
-            strides=(2, 2),
-            padding="VALID",
-            kernel_init=nn.initializers.he_normal(),
-        )(x)
-        x = normalize(x)
-        x = nn.relu(x)
-        x = nn.Conv(
-            64,
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            padding="VALID",
-            kernel_init=nn.initializers.he_normal(),
-        )(x)
-        x = normalize(x)
-        x = nn.relu(x)
-        x = x.reshape((x.shape[0], -1))
-        x = nn.Dense(512, kernel_init=nn.initializers.he_normal())(x)
-        x = normalize(x)
-        x = nn.relu(x)
-        return x
-
-
-# class QNetwork(nn.Module):
-#     action_dim: int
-#     norm_type: str = "layer_norm"
-#     norm_input: bool = False
-
-#     @nn.compact
-#     def __call__(self, x: jnp.ndarray, train: bool):
-#         x = jnp.transpose(x, (0, 2, 3, 1))
-#         if self.norm_input:
-#             x = nn.BatchNorm(use_running_average=not train)(x)
-#         else:
-#             # dummy normalize input for global compatibility
-#             x_dummy = nn.BatchNorm(use_running_average=not train)(x)
-#             x = x / 255.0
-#         x = CNN(norm_type=self.norm_type)(x, train)
-#         x = nn.Dense(self.action_dim)(x)
-#         return x
-
-# --- Dopamine-style IMPALA blocks (Flax) ---
-
-class Stack(nn.Module):
-    """max-pool + two residual conv blocks, like Dopamine's Stack, WITH norm."""
-    num_ch: int
-    num_blocks: int = 2
-    use_max_pooling: bool = True
-    norm_type: str = "layer_norm"  # <--- add
-
-    @nn.compact
-    def __call__(self, x, *, train: bool):
-        init = nn.initializers.xavier_uniform()
-
-        def normalize(y):
-            if self.norm_type == "layer_norm":
-                return nn.LayerNorm()(y)
-            elif self.norm_type == "batch_norm":
-                return nn.BatchNorm(use_running_average=not train)(y)
-            else:
-                return y
-
-        # 3x3 conv then optional 3x3 max-pool stride 2
-        x = nn.Conv(self.num_ch, kernel_size=(3,3), strides=(1,1),
-                    padding="SAME", kernel_init=init)(x)
-        x = normalize(x)                # <--- norm just like your CNN
-        x = nn.relu(x)
-        if self.use_max_pooling:
-            x = nn.max_pool(x, window_shape=(3,3), strides=(2,2), padding="SAME")
-
-        # Two residual blocks: (ReLU -> Conv -> Norm) x2 + skip
-        for _ in range(self.num_blocks):
-            skip = x
-            h = nn.relu(x)
-            h = nn.Conv(self.num_ch, kernel_size=(3,3), strides=(1,1),
-                        padding="SAME", kernel_init=init)(h)
-            h = normalize(h)            # <--- norm
-            h = nn.relu(h)
-            h = nn.Conv(self.num_ch, kernel_size=(3,3), strides=(1,1),
-                        padding="SAME", kernel_init=init)(h)
-            h = normalize(h)            # <--- norm
-            x = skip + h
-        return x
+from purejaxql.utils.atari_wrapper import (
+    JaxLogEnvPoolWrapper, 
+    Transition, 
+    CustomTrainState,
+    eps_greedy_exploration,
+)
+from purejaxql.networks import create_network
+from purejaxql.logging_utils import PQNMetricsLogger
 
 
 
-class ImpalaEncoder(nn.Module):
-    nn_scale: int = 1
-    stack_sizes: tuple = (16, 32, 32)
-    num_blocks: int = 2
-    norm_type: str = "layer_norm"   # <--- add
-
-    def setup(self):
-        self.stacks = [
-            Stack(num_ch=s * self.nn_scale, num_blocks=self.num_blocks, norm_type=self.norm_type)
-            for s in self.stack_sizes
-        ]
-
-    @nn.compact
-    def __call__(self, x, *, train: bool):
-        for s in self.stacks:
-            x = s(x, train=train)
-        return nn.relu(x)
-
-
-
-class ImpalaBackbone(nn.Module):
-    """
-    Full Dopamine-style IMPALA body + dense(512).
-    Matches: xavier_uniform in convs and dense, ReLU, /255.0 preprocessing.
-    """
-    nn_scale: int = 1
-    final_dim: int = 512
-    inputs_preprocessed: bool = False  # False => divide by 255.0 like Dopamine
-
-    @nn.compact
-    def __call__(self, x: jnp.ndarray, *, train: bool) -> jnp.ndarray:
-        init = nn.initializers.xavier_uniform()
-
-        # Create a no-op BN to keep a batch_stats collection (for your TrainState)
-        if not self.inputs_preprocessed:
-            _ = nn.BatchNorm(use_running_average=not train)(x)  # ignored output
-            x = x.astype(jnp.float32) / 255.0
-        else:
-            x = nn.BatchNorm(use_running_average=not train)(x)
-
-        x = ImpalaEncoder(nn_scale=self.nn_scale)(x, train=train)
-        x = x.reshape((x.shape[0], -1))              # flatten per-batch
-        x = nn.Dense(self.final_dim, kernel_init=init)(x)
-        x = nn.relu(x)
-        return x
-
-
-class ImpalaBackbone(nn.Module):
-    nn_scale: int = 1
-    final_dim: int = 512
-    inputs_preprocessed: bool = False
-    norm_type: str = "layer_norm"   # <--- add
-
-    @nn.compact
-    def __call__(self, x: jnp.ndarray, *, train: bool) -> jnp.ndarray:
-        init = nn.initializers.xavier_uniform()
-
-        # Keep a BN to ensure batch_stats collection exists regardless of norm_type
-        if not self.inputs_preprocessed:
-            _ = nn.BatchNorm(use_running_average=not train)(x)
-            x = x.astype(jnp.float32) / 255.0
-        else:
-            x = nn.BatchNorm(use_running_average=not train)(x)
-
-        x = ImpalaEncoder(nn_scale=self.nn_scale, norm_type=self.norm_type)(x, train=train)
-        x = x.reshape((x.shape[0], -1))
-        x = nn.Dense(self.final_dim, kernel_init=init)(x)
-
-        # same normalization pattern as your CNN after the dense
-        if self.norm_type == "layer_norm":
-            x = nn.LayerNorm()(x)
-        elif self.norm_type == "batch_norm":
-            x = nn.BatchNorm(use_running_average=not train)(x)
-
-        x = nn.relu(x)
-        return x
-
-
-class QNetwork(nn.Module):
-    action_dim: int
-    norm_type: str = "layer_norm"
-    norm_input: bool = False
-
-    backbone: str = "impala_dopa_exact"
-    impala_scale: int = 1
-    impala_final_dim: int = 512
-    impala_inputs_preprocessed: bool = False
-
-    @nn.compact
-    def __call__(self, x: jnp.ndarray, train: bool):
-        x = jnp.transpose(x, (0, 2, 3, 1))
-
-        if self.backbone.lower() == "impala_dopa_exact":
-            feats = ImpalaBackbone(
-                nn_scale=self.impala_scale,
-                final_dim=self.impala_final_dim,
-                inputs_preprocessed=self.impala_inputs_preprocessed,
-                norm_type=self.norm_type,                        # <--- pass through
-            )(x, train=train)
-            init = nn.initializers.xavier_uniform()
-            q = nn.Dense(self.action_dim, kernel_init=init)(feats)
-            return q
-
-        # fallback Nature-CNN (unchanged)
-        if self.norm_input:
-            x = nn.BatchNorm(use_running_average=not train)(x)
-        else:
-            _ = nn.BatchNorm(use_running_average=not train)(x)
-            x = x / 255.0
-        feats = CNN(norm_type=self.norm_type)(x, train)
-        q = nn.Dense(self.action_dim)(feats)
-        return q
-
-
-
-
-@chex.dataclass(frozen=True)
-class Transition:
-    obs: chex.Array
-    action: chex.Array
-    reward: chex.Array
-    done: chex.Array
-    next_obs: chex.Array
-    q_val: chex.Array
-
-
-class CustomTrainState(TrainState):
-    batch_stats: Any
-    timesteps: int = 0
-    n_updates: int = 0
-    grad_steps: int = 0
 
 
 def make_train(config):
@@ -282,6 +51,20 @@ def make_train(config):
     )
     # Same idea but for schedules (ε / LR). 
     # You often want the decay horizon to be decoupled from the total training budget:
+    
+    # ---- S-rank config (host cadence + sample size)
+    srank_tau = 0.01
+    srank_period_env = config["NUM_STEPS"] * config["NUM_ENVS"] * 1
+    srank_sample_size = 512
+        # ---- Dormancy config (host cadence + thresholds)
+    # ---- Dormancy config (host constants)
+    dorm_taus = [0.1, 0.01, 0.001, 0.0]
+    TAUS_F32 = jnp.asarray(dorm_taus, dtype=jnp.float32)  # for JAX math
+    # purely host-side labels (no tracer→float)
+    TAU_LABELS = tuple(("{:.6g}".format(t)).rstrip("0").rstrip(".") for t in dorm_taus)
+    DORM_ZERO = jnp.zeros((len(dorm_taus),), dtype=jnp.int32)       # shape helper
+
+
     
     assert (config["NUM_STEPS"] * config["NUM_ENVS"]) % config[
         "NUM_MINIBATCHES"
@@ -309,22 +92,6 @@ def make_train(config):
     )
     env = make_env(total_envs) # create all envs at once (test + train)
 
-    # epsilon-greedy exploration
-    def eps_greedy_exploration(rng, q_vals, eps):
-        rng_a, rng_e = jax.random.split(
-            rng
-        )  # a key for sampling random actions and one for picking
-        greedy_actions = jnp.argmax(q_vals, axis=-1)
-        chosed_actions = jnp.where(
-            jax.random.uniform(rng_e, greedy_actions.shape)
-            < eps,  # pick the actions that should be random
-            jax.random.randint(
-                rng_a, shape=greedy_actions.shape, minval=0, maxval=q_vals.shape[-1]
-            ),  # sample random actions,
-            greedy_actions,
-        )
-        return chosed_actions
-
     # here reset must be out of vmap and jit
     init_obs, env_state = env.reset()
 
@@ -348,26 +115,46 @@ def make_train(config):
         lr = lr_scheduler if config.get("LR_LINEAR_DECAY", False) else config["LR"]
 
         # INIT NETWORK AND OPTIMIZER
-        # network = QNetwork(
-        #     action_dim=env.single_action_space.n,
-        #     norm_type=config["NORM_TYPE"],
-        #     norm_input=config.get("NORM_INPUT", False),
-        # )
-        network = QNetwork(
-            action_dim=env.single_action_space.n,
-            norm_type=config["NORM_TYPE"],
-            norm_input=config.get("NORM_INPUT", False),
-            backbone="impala_dopa_exact",          # <-- add
-            impala_scale=1,                     # <-- add
-            impala_final_dim=512,           # <-- add
-            impala_inputs_preprocessed=False,  # <-- add
-        )
+        network = create_network(config, env.single_action_space.n)
+
+        # ---- capture penultimate features (used from host)
+        def _capture_penultimate_filter(module, method_name):
+            name = module.__class__.__name__
+            return (method_name == "__call__") and (name in ("ImpalaBackbone", "CNN"))
+
+        def _penultimate_feats(network, params, batch_stats, x):
+            # returns [B, D] features
+            _, st = network.apply(
+                {"params": params, "batch_stats": batch_stats},
+                x,
+                train=False,
+                capture_intermediates=_capture_penultimate_filter,
+                mutable=["intermediates"],
+            )
+            inter = st["intermediates"]
+            feats = None
+            # pick the last captured "__call__" from any matching scope (e.g. "ImpalaBackbone_0")
+            for k, v in inter.items():
+                if "__call__" in v:
+                    feats = v["__call__"][-1]
+            if feats is None:
+                # fall back: just return a dummy zero (will make srank=0)
+                return jnp.zeros((x.shape[0], 1), x.dtype)
+            feats = feats.reshape(feats.shape[0], -1)
+            return feats
+
+        def _srank_from_feats(feats, tau=0.01):
+            # singular values only (no U,V) -> 1D [min(B,D)]
+            s = jnp.linalg.svd(feats, full_matrices=False, compute_uv=False)
+            # guard empty or degenerate
+            s0 = jnp.where(s.size > 0, s[0], jnp.array(0.0, s.dtype))
+            cutoff = jnp.asarray(tau, s.dtype) * jnp.maximum(s0, jnp.asarray(1e-12, s.dtype))
+            return jnp.sum(s >= cutoff).astype(jnp.int32)
 
         def create_agent(rng):
             rng, rng_sparse = jax.random.split(rng, 2)
             init_x = jnp.zeros((1, *env.single_observation_space.shape))
             network_variables = network.init(rng, init_x, train=False)
-            # TODO: Add updater from jaxpruner
             sparse_config = create_jaxpruner_config(config)
             sparse_config.rng_seed = rng_sparse
             pruner = api.create_updater_from_config(
@@ -400,7 +187,7 @@ def make_train(config):
             def _step_env(carry, _):
                 last_obs, env_state, rng = carry
                 rng, rng_a, rng_s = jax.random.split(rng, 3)
-                # TODO: Add post gradient update on params 
+                
                 q_vals = network.apply(
                     {
                         "params": train_state.params,
@@ -489,6 +276,21 @@ def make_train(config):
             lambda_targets = _compute_targets(
                 last_q, transitions.q_val, transitions.reward, transitions.done
             )
+            
+            # ---- sample a fixed batch of observations from this update
+            flat_obs = transitions.obs.reshape(-1, *transitions.obs.shape[2:])  # [T*E, C, H, W]
+            rng, rng_srank = jax.random.split(rng)
+            idx = jax.random.permutation(rng_srank, flat_obs.shape[0])[:512]
+            obs_sample = flat_obs[idx]
+
+            # ---- compute S-rank every N updates (N=1 at first to verify)
+            do_srank = (train_state.n_updates % jnp.int32(1)) == 0
+
+            def _compute(_):
+                feats = _penultimate_feats(network, train_state.params, train_state.batch_stats, obs_sample)
+                return _srank_from_feats(feats)
+
+            srank_val = jax.lax.cond(do_srank, _compute, lambda _: jnp.int32(-1), operand=None)
 
             # NETWORKS UPDATE
             def _learn_epoch(carry, _):
@@ -515,9 +317,9 @@ def make_train(config):
 
                         loss = 0.5 * jnp.square(chosen_action_qvals - target).mean()
 
-                        return loss, (updates, chosen_action_qvals)
+                        return loss, (updates, chosen_action_qvals, q_vals)
 
-                    (loss, (updates, qvals)), grads = jax.value_and_grad(
+                    (loss, (updates, qvals, full_q)), grads = jax.value_and_grad(
                         _loss_fn, has_aux=True
                     )(train_state.params)
                     train_state = train_state.apply_gradients(grads=grads)
@@ -573,24 +375,39 @@ def make_train(config):
             param_sparsity = utils.summarize_sparsity(train_state.params, only_total_sparsity=True)
             mask_sparsity = utils.summarize_sparsity(train_state.opt_state.masks, only_total_sparsity=True)
             
+            def _compute_q_estimation_norm(qvals: jnp.ndarray) -> float:
+                """Average L2 norm of Q(s,·) vectors (QNorm)"""
+                q = qvals.reshape(-1, qvals.shape[-1])
+                norms = jnp.linalg.norm(q, axis=-1)
+                return jnp.mean(norms)
+            
+            def _compute_parameter_l2(params) -> jnp.ndarray:
+                return optax.global_norm(params)
+            
             metrics = {
-                "env_step": train_state.timesteps,
-                "update_steps": train_state.n_updates,
+                "training/env_step": train_state.timesteps,
+                "training/update_steps": train_state.n_updates,
                 "env_frame": train_state.timesteps
                 * env.observation_space.shape[
                     0
                 ],  # first dimension of the observation space is number of stacked frames
-                "grad_steps": train_state.grad_steps,
-                "td_loss": loss.mean(),
-                "qvals": qvals.mean(),
-                "param_sparsity": param_sparsity['_total_sparsity'],
-                "mask_sparsity": mask_sparsity['_total_sparsity'],
+                "training/grad_steps": train_state.grad_steps,
+                "training/td_loss": loss.mean(),
+                "q_values/qvals": qvals.mean(),
+                "q_values/QVarience": jnp.var(qvals),
+                "q_values/QNorm(l2)": _compute_q_estimation_norm(qvals),
+                "target/target_varience": jnp.var(lambda_targets),
+                "sparsity/param_sparsity": param_sparsity['_total_sparsity'],
+                "sparsity/mask_sparsity": mask_sparsity['_total_sparsity'],
+                "params/param_norm(l2)": _compute_parameter_l2(train_state.params),
+                "rep/srank": srank_val,
             }
-            
+
 
             metrics.update({k: v.mean() for k, v in infos.items()})
             if config.get("TEST_DURING_TRAINING", False):
                 metrics.update({f"test/{k}": v.mean() for k, v in test_infos.items()})
+            
 
             # report on wandb if required
             if config["WANDB_MODE"] != "disabled":
@@ -603,7 +420,7 @@ def make_train(config):
                                 for k, v in metrics.items()
                             }
                         )
-                    wandb.log(metrics, step=metrics["update_steps"])
+                    wandb.log(metrics, step=metrics["training/update_steps"])
 
                 jax.debug.callback(callback, metrics, original_seed)
 
@@ -643,7 +460,7 @@ def single_run(config):
             env_name.upper(),
             f"jax_{jax.__version__}",
         ],
-        name=f'{config["ALG_NAME"]}_{config["ENV_NAME"]}', # TODO: add jaxpruner info to run name as well
+        name=f'{config["ALG_NAME"]}_{config["ENV_NAME"]}_{config["SEED"]}_{config["PRUNER_KWARGS"]["pruner"]}_{config["PRUNER_KWARGS"]["sparsity"]}', # TODO: add jaxpruner info to run name as well
         config=config,
         mode=config["WANDB_MODE"],
     )
