@@ -8,6 +8,8 @@ EPS_FINISH: 0.001
 EPS_DECAY: 0.1 # ratio of total updates
 NUM_EPOCHS: 2 # number of epochs per update
 NUM_MINIBATCHES: 32 # minibatches per epoch
+NETWORK_NAME: "impala"
+NETWORK_WIDTH: 1
 NORM_TYPE: "layer_norm" # layer_norm or batch_norm
 LR: 0.00025
 MAX_GRAD_NORM: 10
