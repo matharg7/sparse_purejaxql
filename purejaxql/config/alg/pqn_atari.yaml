@@ -1,6 +1,6 @@
 ALG_NAME: "pqn"
-TOTAL_TIMESTEPS: 5e7 # with 4 frame skip correpsnds to 200M frames
-TOTAL_TIMESTEPS_DECAY: 5e7 # will be used for decay functions (epsilon and lr)
+TOTAL_TIMESTEPS: 1e7 # with 5e7 for 200M 4 frame skip correpsnds to 200M frames
+TOTAL_TIMESTEPS_DECAY: 1e7 # will 5e7 for 200M 4 be used for decay functions (epsilon and lr)
 NUM_ENVS: 128 # parallel environments
 NUM_STEPS: 32 # steps per environment in each update
 EPS_START: 1.
@@ -9,7 +9,7 @@ EPS_DECAY: 0.1 # ratio of total updates
 NUM_EPOCHS: 2 # number of epochs per update
 NUM_MINIBATCHES: 32 # minibatches per epoch
 NETWORK_NAME: "impala"
-NETWORK_WIDTH: 1
+NETWORK_WIDTH: 3
 NORM_TYPE: "layer_norm" # layer_norm or batch_norm
 LR: 0.00025
 MAX_GRAD_NORM: 10
@@ -36,6 +36,13 @@ PRUNER_KWARGS:
   end_step: 624000 
   sparsity_distribution: "erk"
   drop_fraction: 0.3
+
+ANALYSIS_KWARGS:
+  ANALYSIS_PERIOD: 1000
+  srank_tau: 0.01
+  srank_sample_size: 512
+  taus: [0.1, 0.01, 0.001, 0.0001, 0]
+  grama_taus: [0.1, 0.05, 0.001]
 
 # evaluation
 TEST_DURING_TRAINING: True 
