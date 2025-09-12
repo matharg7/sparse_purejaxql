@@ -3,7 +3,27 @@ import jax.numpy as jnp
 from flax import struct
 import numpy as np
 from functools import partial
+import copy
+import time
+import os
+import jax
+import jax.numpy as jnp
+import numpy as np
+from typing import Any
 
+import chex
+import optax
+import flax.linen as nn
+from flax.training.train_state import TrainState
+import hydra
+from omegaconf import OmegaConf
+import wandb
+import jaxpruner
+from jaxpruner import api
+from jaxpruner import utils
+import envpool
+import ml_collections
+from functools import partial
 import gym
 from packaging import version
 
@@ -167,3 +187,38 @@ class JaxLogEnvPoolWrapper(gym.Wrapper):
             dones,
             infos,
         )
+        
+        
+@chex.dataclass(frozen=True)
+class Transition:
+    obs: chex.Array
+    action: chex.Array
+    reward: chex.Array
+    done: chex.Array
+    next_obs: chex.Array
+    q_val: chex.Array
+
+
+class CustomTrainState(TrainState):
+    batch_stats: Any
+    perturbations: Any = None  # for storing weight perturbations
+    timesteps: int = 0
+    n_updates: int = 0
+    grad_steps: int = 0
+    
+# epsilon-greedy exploration
+def eps_greedy_exploration(rng, q_vals, eps):
+    rng_a, rng_e = jax.random.split(
+        rng
+    )  # a key for sampling random actions and one for picking
+    greedy_actions = jnp.argmax(q_vals, axis=-1)
+    chosed_actions = jnp.where(
+        jax.random.uniform(rng_e, greedy_actions.shape)
+        < eps,  # pick the actions that should be random
+        jax.random.randint(
+            rng_a, shape=greedy_actions.shape, minval=0, maxval=q_vals.shape[-1]
+        ),  # sample random actions,
+        greedy_actions,
+    )
+    return chosed_actions
+
