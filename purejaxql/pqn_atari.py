@@ -34,10 +34,6 @@ from purejaxql.utils.atari_wrapper import (
 from purejaxql.networks import create_network
 import purejaxql.logging_utils as analysis
 
-
-
-
-
 def make_train(config):
 
     config["NUM_UPDATES"] = (
@@ -234,6 +230,73 @@ def make_train(config):
             lambda_targets = _compute_targets(
                 last_q, transitions.q_val, transitions.reward, transitions.done
             )
+            
+            rng, sample_rng = jax.random.split(rng)
+            full_batch_size = config["NUM_STEPS"] * config["NUM_ENVS"]
+            flat_transitions = jax.tree_util.tree_map(
+                lambda x: x.reshape(full_batch_size, *x.shape[2:]),
+                transitions
+            )
+            flat_targets = lambda_targets.reshape(full_batch_size)
+            sample_size = config["ANALYSIS_KWARGS"]["ANALYSIS_SAMPLE_SIZE"]
+            indices = jax.random.choice(sample_rng, full_batch_size, shape=(sample_size,), replace=False)
+
+            analysis_transitions_sampled = jax.tree_util.tree_map(lambda x: x[indices], flat_transitions)
+            analysis_targets_sampled = flat_targets[indices]
+            analysis_minibatch = Transition(
+                obs=analysis_transitions_sampled.obs,
+                action=analysis_transitions_sampled.action,
+                reward=analysis_transitions_sampled.reward,
+                done=analysis_transitions_sampled.done,
+                next_obs=analysis_transitions_sampled.next_obs,
+                q_val=analysis_transitions_sampled.q_val,
+            )
+            func_to_shape = partial(
+                analysis.compute_combined_dormancy_metrics,
+                network=network,
+                config=config,
+                action_dim=env.single_action_space.n
+            )
+            
+            dummy_metrics_tree = jax.eval_shape(
+                func_to_shape,
+                params=train_state.params,
+                batch_stats=train_state.batch_stats,
+                perturbations=train_state.perturbations,
+                minibatch=analysis_minibatch, # Use the sampled minibatch for shape inference
+                target=analysis_targets_sampled,
+            )
+            
+            dummy_metrics_tree = jax.tree_util.tree_map(
+                lambda x: jnp.zeros(x.shape, x.dtype),
+                dummy_metrics_tree
+            )
+            # dummy_metrics_tree = analysis.create_dummy_analysis_metrics(config)
+            
+            def _compute_analysis_on_batch(state_and_data):
+                ts, mb, t = state_and_data
+                return analysis.compute_combined_dormancy_metrics(
+                    network,
+                    ts.params,
+                    ts.batch_stats,
+                    ts.perturbations,
+                    mb,
+                    t,
+                    config,
+                    env.single_action_space.n
+                )
+                            
+            def _no_op_analysis(_):
+                return dummy_metrics_tree
+
+            # should_log_analysis_batch = (train_state.n_updates % config["ANALYSIS_KWARGS"]["ANALYSIS_BATCH_PERIOD"]) == 0
+            # analysis_metrics = jax.lax.cond(
+            #     should_log_analysis_batch,
+            #     _compute_analysis_on_batch,
+            #     _no_op_analysis,
+            #     operand=(train_state, analysis_minibatch, analysis_targets_sampled) # Pass the sampled data
+            # )
+
             # NETWORKS UPDATE
             def _learn_epoch(carry, _):
                 train_state, rng = carry
@@ -271,51 +334,51 @@ def make_train(config):
                         grad_steps=train_state.grad_steps + 1,
                         batch_stats=updates["batch_stats"],
                     )
-                    func_to_shape = partial(
-                        analysis.compute_combined_dormancy_metrics,
-                        network=network,
-                        config=config,
-                        action_dim=env.single_action_space.n
-                    )
-                    dummy_metrics_tree = jax.eval_shape(
-                        func_to_shape,
-                        params=train_state.params, 
-                        batch_stats=train_state.batch_stats,
-                        perturbations=train_state.perturbations, 
-                        minibatch=minibatch, 
-                        target=target,
-                    )
+                    # func_to_shape = partial(
+                    #     analysis.compute_combined_dormancy_metrics,
+                    #     network=network,
+                    #     config=config,
+                    #     action_dim=env.single_action_space.n
+                    # )
+                    # dummy_metrics_tree = jax.eval_shape(
+                    #     func_to_shape,
+                    #     params=train_state.params, 
+                    #     batch_stats=train_state.batch_stats,
+                    #     perturbations=train_state.perturbations, 
+                    #     minibatch=minibatch, 
+                    #     target=target,
+                    # )
                     
-                    dummy_metrics_tree = jax.tree_util.tree_map(
-                        lambda x: jnp.zeros(x.shape, x.dtype), 
-                        dummy_metrics_tree
-                    )
+                    # dummy_metrics_tree = jax.tree_util.tree_map(
+                    #     lambda x: jnp.zeros(x.shape, x.dtype), 
+                    #     dummy_metrics_tree
+                    # )
                     
-                    def _compute_analysis(op):
-                        train_state, minibatch, target = op
-                        return analysis.compute_combined_dormancy_metrics(
-                            network, 
-                            train_state.params, 
-                            train_state.batch_stats,
-                            train_state.perturbations, 
-                            minibatch, 
-                            target, 
-                            config,
-                            env.single_action_space.n
-                        )
+                    # def _compute_analysis(op):
+                    #     train_state, minibatch, target = op
+                    #     return analysis.compute_combined_dormancy_metrics(
+                    #         network, 
+                    #         train_state.params, 
+                    #         train_state.batch_stats,
+                    #         train_state.perturbations, 
+                    #         minibatch, 
+                    #         target, 
+                    #         config,
+                    #         env.single_action_space.n
+                    #     )
                         
-                    def _no_op_analysis(_):
-                        return dummy_metrics_tree
+                    # def _no_op_analysis(_):
+                    #     return dummy_metrics_tree
                     
-                    should_log_analysis = (train_state.grad_steps % config["ANALYSIS_KWARGS"]["ANALYSIS_PERIOD"]) == 0
-                    analysis_metrics = jax.lax.cond(
-                        should_log_analysis,
-                        _compute_analysis,
-                        _no_op_analysis,
-                        operand=(train_state, minibatch, target)
-                    )
+                    # should_log_analysis = (train_state.grad_steps % config["ANALYSIS_KWARGS"]["ANALYSIS_PERIOD"]) == 0
+                    # analysis_metrics = jax.lax.cond(
+                    #     should_log_analysis,
+                    #     _compute_analysis,
+                    #     _no_op_analysis,
+                    #     operand=(train_state, minibatch, target)
+                    # )
                     
-                    return (train_state, rng), (loss, qvals, analysis_metrics)
+                    return (train_state, rng), (loss, qvals, full_q) #, analysis_metrics)
                 
                 # This is just to shuffle the minibatches
                 def preprocess_transition(x, rng):
@@ -337,17 +400,26 @@ def make_train(config):
                 )
 
                 rng, _rng = jax.random.split(rng)
-                (train_state, rng), (loss, qvals, analysis_metrics) = jax.lax.scan(
+                (train_state, rng), (loss, qvals, full_q) = jax.lax.scan(
                     _learn_phase, (train_state, rng), (minibatches, targets)
                 )
                 
 
-                return (train_state, rng), (loss, qvals, analysis_metrics)
+                return (train_state, rng), (loss, qvals, full_q) #, analysis_metrics)
 
             rng, _rng = jax.random.split(rng)
-            (train_state, rng), (loss, qvals, analysis_metrics) = jax.lax.scan(
-                _learn_epoch, (train_state, rng), None, config["NUM_EPOCHS"]
+            (train_state, rng), (loss, qvals, full_q) = jax.lax.scan(
+                _learn_epoch, (train_state, rng), None, config["NUM_EPOCHS"] # <- Increasing Num expochs increases num gradient steps... this is where I could leverage extended training?
             )
+            
+            should_log_analysis_batch = (train_state.n_updates % config["ANALYSIS_KWARGS"]["ANALYSIS_BATCH_PERIOD"]) == 0
+            analysis_metrics = jax.lax.cond(
+                should_log_analysis_batch,
+                _compute_analysis_on_batch,
+                _no_op_analysis,
+                operand=(train_state, analysis_minibatch, analysis_targets_sampled) # Pass the sampled data
+            )
+            
             post_params = post_op(train_state.params, train_state.opt_state)
             train_state = train_state.replace(params=post_params)
             train_state = train_state.replace(n_updates=train_state.n_updates + 1)
@@ -360,7 +432,6 @@ def make_train(config):
             # Added logging for differnt analysis metrics.
             param_sparsity = utils.summarize_sparsity(train_state.params, only_total_sparsity=True)
             mask_sparsity = utils.summarize_sparsity(train_state.opt_state.masks, only_total_sparsity=True)
-            
             metrics = {
                 "training/env_step": train_state.timesteps,
                 "training/update_steps": train_state.n_updates,
@@ -371,12 +442,12 @@ def make_train(config):
                 "training/grad_steps": train_state.grad_steps,
                 "training/td_loss": loss.mean(),
                 "q_values/qvals": qvals.mean(),
-                "q_values/QVarience": jnp.var(qvals),
-                "q_values/QNorm(l2)": analysis.compute_q_estimation_norm(qvals),
+                "q_values/QVarience": jnp.var(jnp.max(full_q, axis=-1)),
+                "q_values/QNorm(l2)": jnp.linalg.norm(full_q, axis=-1).mean(),
                 "target/target_varience": jnp.var(lambda_targets),
                 "sparsity/param_sparsity": param_sparsity['_total_sparsity'],
                 "sparsity/mask_sparsity": mask_sparsity['_total_sparsity'],
-                "params/param_norm(l2)": analysis.compute_parameter_l2(train_state.params),
+                "params/param_norm(l2)": optax.global_norm(train_state.params),
             }
 
 
@@ -388,39 +459,32 @@ def make_train(config):
             # report on wandb if required
             if config["WANDB_MODE"] != "disabled":
 
+                # The new, simplified callback
                 def callback(metrics, analysis_metrics, original_seed):
+                    # This part is unchanged
                     if config.get("WANDB_LOG_ALL_SEEDS", False):
-                        metrics.update(
-                            {
-                                f"rng{int(original_seed)}/{k}": v
-                                for k, v in metrics.items()
-                            }
-                        )
-                    # wandb.log(metrics, step=metrics["training/update_steps"])
+                        metrics.update({f"rng{int(original_seed)}/{k}": v for k, v in metrics.items()})
                     wandb.log(metrics)
                     
-                    if 'srank' in analysis_metrics:
-                        num_valid_steps = analysis_metrics['srank'].shape[0] * analysis_metrics['srank'].shape[1]
-                        flat_metrics = jax.tree_util.tree_map(
-                            lambda x: x.reshape(num_valid_steps, *x.shape[2:]), analysis_metrics
-                        )
-                        base_step = metrics["training/grad_steps"] - config["NUM_EPOCHS"] * config["NUM_MINIBATCHES"]
-                        for i in range(num_valid_steps):
-                            current_grad_step = base_step + i + 1
-                            if current_grad_step % config["ANALYSIS_KWARGS"]["ANALYSIS_PERIOD"] == 0:
-                                single_step_metrics = jax.tree_util.tree_map(lambda x: x[i], flat_metrics)
-                                restructured_log = analysis.restructure_single_step_metrics(
-                                    single_step_metrics
-                                )
-                                
-                                final_log = {}
-                                for key, val in restructured_log.items():
-                                    final_log[f'analysis/{key}'] = val
-                                final_log['training/grad_steps'] = current_grad_step
-                                wandb.log(final_log)
+                    # --- START OF CHANGES ---
 
+                    # 1. No more complex reshaping or looping.
+                    # 2. A simple check to see if the analysis was run in this update.
+                    #    The dummy metric tree we created has srank=0, so this works perfectly.
+                    if analysis_metrics['srank'] > 0:
+                        
+                        # 3. Restructure and log the single metric dictionary.
+                        restructured_log = analysis.restructure_single_step_metrics(analysis_metrics)
+                        
+                        final_log = {}
+                        for key, val in restructured_log.items():
+                            final_log[f'analysis/{key}'] = val
+                            
+                        # 4. Log against the current gradient step for consistent plotting.
+                        final_log['training/grad_steps'] = metrics["training/grad_steps"]
+                        wandb.log(final_log)
 
-
+                # The call to the callback is also simpler, as analysis_metrics is now a single, top-level variable.
                 jax.debug.callback(callback, metrics, analysis_metrics, original_seed)
 
             runner_state = (train_state, tuple(expl_state), test_metrics, rng)

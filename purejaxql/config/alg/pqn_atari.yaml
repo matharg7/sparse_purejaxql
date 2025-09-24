@@ -31,14 +31,15 @@ ENV_KWARGS:
 PRUNER_KWARGS: 
   pruner: "magnitude"
   sparsity: 0.95
-  update_frequency: 1500
-  start_step: 157500 
-  end_step: 624000 
+  update_frequency: 300
+  start_step: 35000 # 157500 
+  end_step: 125000  # for 200M 624000 
   sparsity_distribution: "erk"
   drop_fraction: 0.3
 
 ANALYSIS_KWARGS:
-  ANALYSIS_PERIOD: 1000
+  ANALYSIS_BATCH_PERIOD: 10
+  ANALYSIS_SAMPLE_SIZE: 512
   srank_tau: 0.01
   srank_sample_size: 512
   taus: [0.1, 0.01, 0.001, 0.0001, 0]
