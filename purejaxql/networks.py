@@ -237,7 +237,7 @@ class ImpalaQNetwork(nn.Module):
         
         # Final Q-values (NO perturbation here as requested)
         q = nn.Dense(self.action_dim)(feats)
-        return q    
+        return q, feats
 
 
 def create_network(config, action_dim):
