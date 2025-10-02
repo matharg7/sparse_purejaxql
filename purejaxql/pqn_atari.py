@@ -136,7 +136,7 @@ def make_train(config):
                 last_obs, env_state, rng = carry
                 rng, rng_a, rng_s = jax.random.split(rng, 3)
 
-                q_vals = network.apply(
+                q_vals, _ = network.apply(
                     {
                         "params": train_state.params,
                         "batch_stats": train_state.batch_stats,
@@ -189,7 +189,7 @@ def make_train(config):
             )  # update timesteps count
 
             # TODO: what is this used for?
-            last_q = network.apply(
+            last_q, _ = network.apply(
                 {
                     "params": train_state.params,
                     "batch_stats": train_state.batch_stats,
@@ -285,14 +285,6 @@ def make_train(config):
             def _no_op_analysis(_):
                 return dummy_metrics_tree
 
-            # should_log_analysis_batch = (train_state.n_updates % config["ANALYSIS_KWARGS"]["ANALYSIS_BATCH_PERIOD"]) == 0
-            # analysis_metrics = jax.lax.cond(
-            #     should_log_analysis_batch,
-            #     _compute_analysis_on_batch,
-            #     _no_op_analysis,
-            #     operand=(train_state, analysis_minibatch, analysis_targets_sampled) # Pass the sampled data
-            # )
-
             # NETWORKS UPDATE
             def _learn_epoch(carry, _):
                 train_state, rng = carry
@@ -303,7 +295,7 @@ def make_train(config):
                     minibatch, target = minibatch_and_target
 
                     def _loss_fn(params):
-                        q_vals, updates = network.apply(
+                        (q_vals, _), updates = network.apply(
                             {"params": params, "batch_stats": train_state.batch_stats},
                             minibatch.obs,
                             train=True,
@@ -330,51 +322,8 @@ def make_train(config):
                         grad_steps=train_state.grad_steps + 1,
                         batch_stats=updates["batch_stats"],
                     )
-                    # func_to_shape = partial(
-                    #     analysis.compute_combined_dormancy_metrics,
-                    #     network=network,
-                    #     config=config,
-                    #     action_dim=env.single_action_space.n
-                    # )
-                    # dummy_metrics_tree = jax.eval_shape(
-                    #     func_to_shape,
-                    #     params=train_state.params,
-                    #     batch_stats=train_state.batch_stats,
-                    #     perturbations=train_state.perturbations,
-                    #     minibatch=minibatch,
-                    #     target=target,
-                    # )
-
-                    # dummy_metrics_tree = jax.tree_util.tree_map(
-                    #     lambda x: jnp.zeros(x.shape, x.dtype),
-                    #     dummy_metrics_tree
-                    # )
-
-                    # def _compute_analysis(op):
-                    #     train_state, minibatch, target = op
-                    #     return analysis.compute_combined_dormancy_metrics(
-                    #         network,
-                    #         train_state.params,
-                    #         train_state.batch_stats,
-                    #         train_state.perturbations,
-                    #         minibatch,
-                    #         target,
-                    #         config,
-                    #         env.single_action_space.n
-                    #     )
-
-                    # def _no_op_analysis(_):
-                    #     return dummy_metrics_tree
-
-                    # should_log_analysis = (train_state.grad_steps % config["ANALYSIS_KWARGS"]["ANALYSIS_PERIOD"]) == 0
-                    # analysis_metrics = jax.lax.cond(
-                    #     should_log_analysis,
-                    #     _compute_analysis,
-                    #     _no_op_analysis,
-                    #     operand=(train_state, minibatch, target)
-                    # )
-
-                    return (train_state, rng), (loss, qvals, full_q) #, analysis_metrics)
+                    gn = optax.global_norm(grads)
+                    return (train_state, rng), (loss, qvals, full_q, gn) #, analysis_metrics)
 
                 # This is just to shuffle the minibatches
                 def preprocess_transition(x, rng):
@@ -396,17 +345,17 @@ def make_train(config):
                 )
 
                 rng, _rng = jax.random.split(rng)
-                (train_state, rng), (loss, qvals, full_q) = jax.lax.scan(
+                (train_state, rng), (loss, qvals, full_q, gn) = jax.lax.scan(
                     _learn_phase, (train_state, rng), (minibatches, targets)
                 )
 
-                return (train_state, rng), (loss, qvals, full_q) #, analysis_metrics)
+                return (train_state, rng), (loss, qvals, full_q, gn) #, analysis_metrics)
 
             rng, _rng = jax.random.split(rng)
-            (train_state, rng), (loss, qvals, full_q) = jax.lax.scan(
+            (train_state, rng), (loss, qvals, full_q, gn) = jax.lax.scan(
                 _learn_epoch, (train_state, rng), None, config["NUM_EPOCHS"] # <- Increasing Num expochs increases num gradient steps... this is where I could leverage extended training?
             )
-
+            
             should_log_analysis_batch = (train_state.n_updates % config["ANALYSIS_KWARGS"]["ANALYSIS_BATCH_PERIOD"]) == 0
             analysis_metrics = jax.lax.cond(
                 should_log_analysis_batch,
@@ -437,12 +386,13 @@ def make_train(config):
                 "training/grad_steps": train_state.grad_steps,
                 "training/td_loss": loss.mean(),
                 "q_values/qvals": qvals.mean(),
-                "q_values/QVarience": jnp.var(jnp.max(full_q, axis=-1)),
-                "q_values/QNorm(l2)": jnp.linalg.norm(full_q, axis=-1).mean(),
-                "target/target_varience": jnp.var(lambda_targets),
+                # "q_values/QVarience": jnp.var(jnp.max(full_q, axis=-1)),
+                "q_values/QNorm(l2)": jnp.linalg.norm(qvals, axis=-1).mean(),
+                "target/QVarience": jnp.var(lambda_targets),
                 "sparsity/param_sparsity": param_sparsity['_total_sparsity'],
                 "sparsity/mask_sparsity": mask_sparsity['_total_sparsity'],
                 "params/param_norm(l2)": optax.global_norm(train_state.params),
+                "grads/grad_norm(l2)": gn.mean(),
             }
 
             metrics.update({k: v.mean() for k, v in infos.items()})
@@ -464,17 +414,18 @@ def make_train(config):
                     # 1. No more complex reshaping or looping.
                     # 2. A simple check to see if the analysis was run in this update.
                     #    The dummy metric tree we created has srank=0, so this works perfectly.
-                    if analysis_metrics['srank'] > 0:
+                    # print(analysis_metrics['ranks/srank_kumar'])
+                    if analysis_metrics['ranks/srank_kumar'] > 0:
 
                         # 3. Restructure and log the single metric dictionary.
                         restructured_log = analysis.restructure_single_step_metrics(analysis_metrics)
 
                         final_log = {}
                         for key, val in restructured_log.items():
-                            final_log[f'analysis/{key}'] = val
+                            final_log[key] = val
 
                         # 4. Log against the current gradient step for consistent plotting.
-                        final_log['training/grad_steps'] = metrics["training/grad_steps"]
+                        # final_log['training/grad_steps'] = metrics["training/grad_steps"]
                         wandb.log(final_log)
 
                 # The call to the callback is also simpler, as analysis_metrics is now a single, top-level variable.
@@ -522,8 +473,8 @@ def single_run(config):
     )
     wandb.define_metric("training/update_steps")
     wandb.define_metric("*", step_metric="training/update_steps")
-    wandb.define_metric("training/grad_steps")
-    wandb.define_metric("analysis/*", step_metric="training/grad_steps")
+    # wandb.define_metric("training/grad_steps")
+    # wandb.define_metric("analysis/*", step_metric="training/grad_steps")
     
     rng = jax.random.PRNGKey(config["SEED"])
 
@@ -532,6 +483,7 @@ def single_run(config):
         raise NotImplementedError("Vmapped seeds not supported yet.") # can't do parallel seeds yet
     else:
         outs = jax.jit(make_train(config))(rng)
+        # outs = make_train(config)(rng) # don't jit for now, as it takes too long to compile
     print(f"Took {time.time()-t0} seconds to complete.")
 
     # save params < -----------------------------
