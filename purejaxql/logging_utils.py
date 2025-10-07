@@ -14,6 +14,7 @@ import jax.numpy as jnp
 from functools import partial
 from jax.tree_util import tree_flatten_with_path, DictKey, SequenceKey
 from typing import Any, Dict, List, Tuple, Optional
+import flax.linen as nn
 
 def compute_q_estimation_norm(qvals: jnp.ndarray) -> float:
     """Average L2 norm of Q(s,·) vectors (QNorm)"""
@@ -111,6 +112,36 @@ def _calculate_normalized_scores(z: jnp.ndarray) -> jnp.ndarray:
     
     return neuron_activity / stable_mean_activity
 
+@partial(jax.jit)
+def _compute_dead_neurons(activations: jnp.ndarray) -> jnp.ndarray:
+    """Computes the COUNT of dead neurons for a single layer's activations.
+    A neuron is considered "dead" if its activation value is never positive across
+    an entire batch of data (i.e., its max activation is <= 0). This metric should be
+    calculated on post-ReLU activations.
+
+    Args:
+        activations: The post-ReLU activation tensor from a layer. It assumes a
+                     channels-last format, e.g., (batch_size, ..., channels).
+
+    Returns:
+        jnp.ndarray: A scalar integer array with the count of dead neurons.
+    """
+    if activations.ndim < 2:
+        return jnp.array(0, dtype=jnp.int32)
+
+    num_neurons = activations.shape[-1]
+
+    def _compute_count():
+        axes_to_max = tuple(range(activations.ndim - 1))
+        max_activations = jnp.max(activations, axis=axes_to_max)
+        dead_count = jnp.sum(max_activations <= 0)
+        return dead_count.astype(jnp.int32)
+
+    def _return_zero():
+        return jnp.array(0, dtype=jnp.int32)
+
+    return jax.lax.cond(num_neurons > 0, _compute_count, _return_zero)
+    
 def compute_detailed_dormancy_metrics(network, params, batch_stats, states: jnp.ndarray, taus: Tuple[float, ...], action_dim: int, intermediates: Optional[Dict] = None) -> Dict[str, jnp.ndarray]:
     """Computes activation-based dormancy metrics."""
     if intermediates is None:
@@ -118,6 +149,8 @@ def compute_detailed_dormancy_metrics(network, params, batch_stats, states: jnp.
         intermediates = state.get("intermediates", {})
     leaves, _ = tree_flatten_with_path(intermediates)
     conv_dense_scores, layernorm_scores = [], []
+    
+    ln_dead_counts, ln_total_neurons = [], []
     
     target_modules = ("Conv", "Dense", "LayerNorm")
     targeted_modules = []
@@ -140,17 +173,39 @@ def compute_detailed_dormancy_metrics(network, params, batch_stats, states: jnp.
         
         if scores.size > 0:
             (layernorm_scores if is_layernorm else conv_dense_scores).append(scores)
+        
+        if is_layernorm:
+            post_relu_activations = jnp.maximum(z, 0)
+            dead_count = _compute_dead_neurons(post_relu_activations)
+            total_layer_neurons = post_relu_activations.shape[-1]
+            
+            # Append counts for later aggregation
+            ln_dead_counts.append(dead_count)
+            ln_total_neurons.append(total_layer_neurons)
+        
     all_conv_dense = jnp.concatenate(conv_dense_scores) if conv_dense_scores else jnp.array([])
     all_layernorm = jnp.concatenate(layernorm_scores) if layernorm_scores else jnp.array([])
     cd_counts, cd_ratios = _compute_dormancy_stats_for_taus(all_conv_dense, taus)
     ln_counts, ln_ratios = _compute_dormancy_stats_for_taus(all_layernorm, taus)
-    metrics = {'conv_dense/total_neurons': jnp.array(all_conv_dense.size, dtype=jnp.int32), 'layernorm_relu/total_neurons': jnp.array(all_layernorm.size, dtype=jnp.int32)}
+    
+    # MODIFIED: Only aggregate LayerNorm dead neuron stats
+    total_ln_dead = jnp.sum(jnp.array(ln_dead_counts))
+    total_ln_neurons = jnp.sum(jnp.array(ln_total_neurons))
+    ln_dead_ratio = jnp.where(total_ln_neurons > 0, total_ln_dead / total_ln_neurons, 0.0)
+    
+    metrics = {
+        'conv_dense/total_neurons': jnp.array(all_conv_dense.size, dtype=jnp.int32), 
+        'layernorm_relu/total_neurons': jnp.array(all_layernorm.size, dtype=jnp.int32), 
+    }
+    
     for i, tau in enumerate(taus):
         tau_str = f"{tau:.4f}".rstrip('0').rstrip('.')
         metrics[f'conv_dense/dormancy_ratio_{tau_str}'] = cd_ratios[i]
         # metrics[f'conv_dense/dormant_count_{tau_str}'] = cd_counts[i]
         metrics[f'layernorm_relu/dormancy_ratio_{tau_str}'] = ln_ratios[i]
         # metrics[f'layernorm_relu/dormant_count_{tau_str}'] = ln_counts[i]
+        
+    metrics['dead_neuron_ratio'] = ln_dead_ratio
     return metrics
 
 def compute_gradient_based_dormancy_metrics(network, params, batch_stats, perturbations, states, actions, targets, taus: Tuple[float, ...], action_dim: int) -> Dict[str, jnp.ndarray]:
@@ -162,6 +217,8 @@ def compute_gradient_based_dormancy_metrics(network, params, batch_stats, pertur
     grad_perturbations = jax.grad(_loss_fn_for_gradients)(perturbations)
     leaves, _ = tree_flatten_with_path(grad_perturbations)
     post_relu_scores, pre_relu_scores = [], []
+    post_dead_counts, post_total_neurons = [], []
+    
     for path, grad_values in leaves:
         if not (isinstance(grad_values, jnp.ndarray) and grad_values.ndim >= 2):
             continue
@@ -172,38 +229,121 @@ def compute_gradient_based_dormancy_metrics(network, params, batch_stats, pertur
         scores = _calculate_normalized_scores(grad_values)
         if scores.size > 0:
             (post_relu_scores if is_post_relu else pre_relu_scores).append(scores)
+            
+        if is_post_relu:
+            dead_count = _compute_dead_neurons(grad_values)
+            total_neurons = grad_values.shape[-1]
+            post_dead_counts.append(dead_count)
+            post_total_neurons.append(total_neurons)
     # jax.debug.breakpoint()
     all_post_relu = jnp.concatenate(post_relu_scores) if post_relu_scores else jnp.array([])
     all_pre_relu = jnp.concatenate(pre_relu_scores) if pre_relu_scores else jnp.array([])
     post_counts, post_ratios = _compute_dormancy_stats_for_taus(all_post_relu, taus)
     pre_counts, pre_ratios = _compute_dormancy_stats_for_taus(all_pre_relu, taus)
-    metrics = {'post_relu/total_neurons': jnp.array(all_post_relu.size, dtype=jnp.int32), 'pre_relu/total_neurons': jnp.array(all_pre_relu.size, dtype=jnp.int32)}
+    
+    total_post_dead = jnp.sum(jnp.array(post_dead_counts))
+    total_post_neurons = jnp.sum(jnp.array(post_total_neurons))
+    post_dead_ratio = jnp.where(total_post_neurons > 0, total_post_dead / total_post_neurons, 0.0)
+    
+    metrics = {
+        'post_relu/total_neurons': jnp.array(all_post_relu.size, dtype=jnp.int32), 
+        'pre_relu/total_neurons': jnp.array(all_pre_relu.size, dtype=jnp.int32)
+    }
     for i, tau in enumerate(taus):
         tau_str = f"{tau:.4f}".rstrip('0').rstrip('.')
         metrics[f'post_relu/dormancy_ratio_{tau_str}'] = post_ratios[i]
         # metrics[f'post_relu/dormant_count_{tau_str}'] = post_counts[i]
         metrics[f'pre_relu/dormancy_ratio_{tau_str}'] = pre_ratios[i]
         # metrics[f'pre_relu/dormant_count_{tau_str}'] = pre_counts[i]
+        
+    metrics['dead_neuron_ratio'] = post_dead_ratio
     return metrics
 
-def compute_combined_dormancy_metrics(network, params, batch_stats, perturbations, minibatch, target, config: Dict, action_dim: int) -> Dict[str, jnp.ndarray]:
+def compute_policy_churn_metrics(
+    network: nn.Module,
+    current_params: Any,
+    old_params: Any,
+    current_batch_stats: Any,
+    old_batch_stats: Any,
+    obs: jnp.ndarray,
+) -> Dict[str, jnp.ndarray]:
+    """Computes policy churn and representation stability metrics."""
+    old_Q, old_reps = network.apply({"params": old_params, "batch_stats": old_batch_stats}, obs, train=False)
+    new_Q, new_reps = network.apply({"params": current_params, "batch_stats": current_batch_stats}, obs, train=False)
+    old_Q_in_new_representation = network.apply(
+        {"params": old_params, "batch_stats": old_batch_stats},
+        new_reps,
+        method=network.apply_head
+    )
+    new_Q_in_old_representation = network.apply(
+        {"params": current_params, "batch_stats": current_batch_stats},
+        old_reps,
+        method=network.apply_head
+    )
+    policy_churn = (jnp.argmax(new_Q, axis=1) != jnp.argmax(old_Q, axis=1)).mean()
+    q_value_stability = (jnp.argmax(new_Q, axis=1) != jnp.argmax(old_Q_in_new_representation, axis=1)).mean()
+    representation_stability = (jnp.argmax(new_Q, axis=1) != jnp.argmax(new_Q_in_old_representation, axis=1)).mean()
+    change_of_policy_due_to_representation = (jnp.argmax(old_Q, axis=1) != jnp.argmax(old_Q_in_new_representation, axis=1)).mean()
+    change_of_policy_due_to_q_values = (jnp.argmax(old_Q, axis=1) != jnp.argmax(new_Q_in_old_representation, axis=1)).mean()
+
+    def cosine_similarity(a, b, axis=-1, eps=1e-8):
+        a_norm = jnp.linalg.norm(a, axis=axis)
+        b_norm = jnp.linalg.norm(b, axis=axis)
+        dot_product = jnp.sum(a * b, axis=axis)
+        return dot_product / (a_norm * b_norm + eps)
+    representations_cosine_similarity = cosine_similarity(old_reps, new_reps).mean()
+    representations_l2_distance = jnp.linalg.norm(old_reps - new_reps, axis=-1).mean()
+    return {
+        "policy_churn": policy_churn,
+        "representation_stability": representation_stability,
+        "q_value_stability": q_value_stability,
+        "change_of_policy_due_to_representation": change_of_policy_due_to_representation,
+        "change_of_policy_due_to_q_values": change_of_policy_due_to_q_values,
+        "representations_cosine_similarity": representations_cosine_similarity,
+        "representations_l2_distance": representations_l2_distance,
+    }
+
+def compute_combined_dormancy_metrics(
+        network, 
+        params,
+        old_params, 
+        batch_stats,
+        old_batch_stats, 
+        perturbations, 
+        minibatch, 
+        target, 
+        config: Dict, 
+        action_dim: int
+    ) -> Dict[str, jnp.ndarray]:
     """Computes all dormancy and S-Rank metrics for a single batch."""
     states, actions = minibatch.obs, minibatch.action
     (_, penultimate_feats),state = network.apply({"params": params, "batch_stats": batch_stats}, states, train=False, capture_intermediates=True, mutable=["intermediates"])
     intermediates = state.get("intermediates", {})
-    # Activation Dormancy
+    # Activation Dormancy 
     activation_metrics = compute_detailed_dormancy_metrics(network, params, batch_stats, states, tuple(config["ANALYSIS_KWARGS"]["taus"]), action_dim, intermediates)
     
-    # Gradient Dormancy
+    # Gradient Dormancy 
     gradient_metrics = compute_gradient_based_dormancy_metrics(network, params, batch_stats, perturbations, states, actions, target, tuple(config["ANALYSIS_KWARGS"]["grama_taus"]), action_dim)
     
     # S-Rank Metrics
     srank_metrics = compute_ranks_from_features_jax(penultimate_feats, config["ANALYSIS_KWARGS"]["srank_tau"])
     
+    churn_metrics = compute_policy_churn_metrics(
+        network,
+        params,
+        old_params,
+        batch_stats,
+        old_batch_stats, # <-- ADDED
+        minibatch.obs
+    )
+    
+    # TODO: Add Gradient kurtosis metrics
+    
     # Combine
     combined_metrics = {f'dormant_neurons/{k}': v for k, v in activation_metrics.items()}
     combined_metrics.update({f'grama/{k}': v for k, v in gradient_metrics.items()})
     combined_metrics.update(srank_metrics)
+    combined_metrics.update({f'churn/{k}': v for k, v in churn_metrics.items()})
     
     return combined_metrics
 
@@ -232,35 +372,6 @@ def restructure_metrics_for_logging(metrics_from_scan: dict) -> list[dict]:
                 d[final_key] = value
         all_epoch_logs.append(epoch_log)
     return all_epoch_logs
-
-# def restructure_single_step_metrics(flat_metrics: dict) -> dict:
-#     """
-#     Restructures a single, flat dictionary of scalar metrics into a nested one.
-#     Designed to be used inside the real-time logging callback.
-#     """
-#     nested_log = {}
-#     for key, value in flat_metrics.items():
-#         parts = key.split('/')
-#         d = nested_log
-#         jax.debug.breakpoint()
-#         for part in parts[:-1]:
-#             d = d.setdefault(part, {})
-        
-#         final_key = parts[-1]
-        
-#         if 'dormancy_ratio_' in final_key:
-#             metric_type = 'ratio'
-#             threshold = final_key.replace('dormancy_ratio_', '')
-#             d = d.setdefault(metric_type, {})
-#             d[threshold] = value
-#         elif 'dormant_count_' in final_key:
-#             metric_type = 'count'
-#             threshold = final_key.replace('dormant_count_', '')
-#             d = d.setdefault(metric_type, {})
-#             d[threshold] = value
-#         else:
-#             d[final_key] = value 
-#     return nested_log
 
 def restructure_single_step_metrics(flat_metrics: dict) -> dict:
     """
