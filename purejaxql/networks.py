@@ -204,20 +204,28 @@ class ImpalaQNetwork(nn.Module):
     impala_final_dim: int = 512
     impala_inputs_preprocessed: bool = False
 
-    @nn.compact
-    def __call__(self, x: jnp.ndarray, train: bool):
-        x = jnp.transpose(x, (0, 2, 3, 1))
-        
-        # Pass the flag down to the backbone
-        feats = ImpalaBackbone(
+    def setup(self):
+        """Define submodules here to make them accessible."""
+        self.backbone = ImpalaBackbone(
             nn_scale=self.impala_scale,
             final_dim=self.impala_final_dim,
             inputs_preprocessed=self.impala_inputs_preprocessed,
-            use_layer_norm=self.use_layer_norm, # <-- CHANGED
-        )(x, train=train)
+            use_layer_norm=self.use_layer_norm,
+        )
+        self.q_head = nn.Dense(self.action_dim)
         
-        q = nn.Dense(self.action_dim)(feats)
+    def __call__(self, x: jnp.ndarray, train: bool):
+        # --- Preprocessing ---
+        x = jnp.transpose(x, (0, 2, 3, 1))
+        
+        # --- Main Forward Pass ---
+        feats = self.backbone(x, train=train)
+        q = self.q_head(feats)
         return q, feats
+    
+    def apply_head(self, feats):
+        """Applies only the final Q-head to a feature representation."""
+        return self.q_head(feats)
 
 
 def create_network(config, action_dim):
