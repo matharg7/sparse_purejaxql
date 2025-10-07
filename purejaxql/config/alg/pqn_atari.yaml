@@ -10,7 +10,8 @@ NUM_EPOCHS: 2 # number of epochs per update
 NUM_MINIBATCHES: 32 # minibatches per epoch
 NETWORK_NAME: "impala"
 NETWORK_WIDTH: 3
-NORM_TYPE: "layer_norm" # layer_norm or batch_norm
+# NORM_TYPE: "layer_norm" # layer_norm or batch_norm
+USE_LAYER_NORM: True
 LR: 0.00025 # 2.5e-4
 MAX_GRAD_NORM: 10
 LR_LINEAR_DECAY: False
