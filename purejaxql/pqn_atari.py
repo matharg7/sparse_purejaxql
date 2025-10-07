@@ -253,11 +253,15 @@ def make_train(config):
                 config=config,
                 action_dim=env.single_action_space.n
             )
-
+            
+            dummy_old_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
+            dummy_old_batch_stats = jax.tree_util.tree_map(lambda x: x, train_state.batch_stats) 
             dummy_metrics_tree = jax.eval_shape(
                 func_to_shape,
                 params=train_state.params,
+                old_params=dummy_old_params,
                 batch_stats=train_state.batch_stats,
+                old_batch_stats=dummy_old_batch_stats,
                 perturbations=train_state.perturbations,
                 minibatch=analysis_minibatch, # Use the sampled minibatch for shape inference
                 target=analysis_targets_sampled,
@@ -269,12 +273,14 @@ def make_train(config):
             )
             # dummy_metrics_tree = analysis.create_dummy_analysis_metrics(config)
 
-            def _compute_analysis_on_batch(state_and_data):
-                ts, mb, t = state_and_data
+            def _compute_analysis_on_batch(state_data_and_old_state):
+                ts, mb, t, old_p, old_bs = state_data_and_old_state
                 return analysis.compute_combined_dormancy_metrics(
                     network,
                     ts.params,
+                    old_p,
                     ts.batch_stats,
+                    old_bs,
                     ts.perturbations,
                     mb,
                     t,
@@ -284,7 +290,6 @@ def make_train(config):
 
             def _no_op_analysis(_):
                 return dummy_metrics_tree
-
             # NETWORKS UPDATE
             def _learn_epoch(carry, _):
                 train_state, rng = carry
@@ -351,6 +356,9 @@ def make_train(config):
 
                 return (train_state, rng), (loss, qvals, full_q, gn) #, analysis_metrics)
 
+            old_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
+            old_batch_stats = jax.tree_util.tree_map(lambda x: x, train_state.batch_stats)
+            
             rng, _rng = jax.random.split(rng)
             (train_state, rng), (loss, qvals, full_q, gn) = jax.lax.scan(
                 _learn_epoch, (train_state, rng), None, config["NUM_EPOCHS"] # <- Increasing Num expochs increases num gradient steps... this is where I could leverage extended training?
@@ -361,7 +369,7 @@ def make_train(config):
                 should_log_analysis_batch,
                 _compute_analysis_on_batch,
                 _no_op_analysis,
-                operand=(train_state, analysis_minibatch, analysis_targets_sampled) # Pass the sampled data
+                operand=(train_state, analysis_minibatch, analysis_targets_sampled, old_params, old_batch_stats) # Pass the sampled data
             )
 
             post_params = post_op(train_state.params, train_state.opt_state)
