@@ -1,0 +1,37 @@
+# To install these requirements, you must use the '--find-links' or '-f' flag
+# so the installer can find the correct JAX CUDA version.
+#
+# COMMAND:
+# pip install -r requirements.txt
+
+# Core JAX Ecosystem (Pinned for Compute Canada)
+jax==0.4.28+computecanada
+jaxlib==0.4.28+cuda12.cudnn89.computecanada
+flax==0.10.4+computecanada
+optax==0.2.5+computecanada
+chex==0.1.90+computecanada
+safetensors>=0.4.2
+
+# Reinforcement Learning Environment
+envpool==0.8.4
+gym==0.23.1
+gymnax==0.0.5
+
+# Experiment Tracking and Configuration
+wandb==0.13.3
+hydra-core>=1.3.0
+omegaconf>=2.3.0
+
+# Scientific Computing & Plotting
+numpy==1.26.4+computecanada
+scipy==1.10.1+computecanada
+matplotlib==3.5.1
+seaborn
+pillow>=10.2.0
+tqdm>=4.66.0
+
+# Pruning Library (from GitHub)
+git+https://github.com/google-research/jaxpruner.git
+
+# Testing (from pyproject.toml)
+pytest
