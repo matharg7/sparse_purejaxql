@@ -129,7 +129,7 @@ def make_train(config):
         # TRAINING LOOP
         def _update_step(runner_state, unused):
 
-            train_state, expl_state, test_metrics, rng = runner_state
+            train_state, expl_state, test_metrics, cumulative_mask, rng = runner_state
 
             # SAMPLE PHASE: This runs one env step for all parallel envs and returns the transition at that step.
             def _step_env(carry, _):
@@ -290,13 +290,15 @@ def make_train(config):
 
             def _no_op_analysis(_):
                 return dummy_metrics_tree
+            
+            
             # NETWORKS UPDATE
             def _learn_epoch(carry, _):
-                train_state, rng = carry
+                train_state, cumulative_mask, rng = carry
 
                 def _learn_phase(carry, minibatch_and_target):
 
-                    train_state, rng = carry
+                    train_state, cumulative_mask, rng = carry
                     minibatch, target = minibatch_and_target
 
                     def _loss_fn(params):
@@ -328,7 +330,12 @@ def make_train(config):
                         batch_stats=updates["batch_stats"],
                     )
                     gn = optax.global_norm(grads)
-                    return (train_state, rng), (loss, qvals, full_q, gn) #, analysis_metrics)
+                    cumulative_mask = jax.tree_util.tree_map(
+                        lambda c, m: jnp.logical_or(c, m).astype(jnp.uint8), # <-- Cast the result back
+                        cumulative_mask,
+                        train_state.opt_state.masks,
+                    )
+                    return (train_state, cumulative_mask, rng), (loss, qvals, full_q, gn) #, analysis_metrics)
 
                 # This is just to shuffle the minibatches
                 def preprocess_transition(x, rng):
@@ -350,18 +357,18 @@ def make_train(config):
                 )
 
                 rng, _rng = jax.random.split(rng)
-                (train_state, rng), (loss, qvals, full_q, gn) = jax.lax.scan(
-                    _learn_phase, (train_state, rng), (minibatches, targets)
+                (train_state, cumulative_mask, rng), (loss, qvals, full_q, gn) = jax.lax.scan(
+                    _learn_phase, (train_state, cumulative_mask, rng), (minibatches, targets)
                 )
 
-                return (train_state, rng), (loss, qvals, full_q, gn) #, analysis_metrics)
+                return (train_state, cumulative_mask, rng), (loss, qvals, full_q, gn) #, analysis_metrics)
 
             old_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
             old_batch_stats = jax.tree_util.tree_map(lambda x: x, train_state.batch_stats)
             
             rng, _rng = jax.random.split(rng)
-            (train_state, rng), (loss, qvals, full_q, gn) = jax.lax.scan(
-                _learn_epoch, (train_state, rng), None, config["NUM_EPOCHS"] # <- Increasing Num expochs increases num gradient steps... this is where I could leverage extended training?
+            (train_state, cumulative_mask, rng), (loss, qvals, full_q, gn) = jax.lax.scan(
+                _learn_epoch, (train_state, cumulative_mask, rng), None, config["NUM_EPOCHS"] # <- Increasing Num expochs increases num gradient steps... this is where I could leverage extended training?
             )
             
             should_log_analysis_batch = (train_state.n_updates % config["ANALYSIS_KWARGS"]["ANALYSIS_BATCH_PERIOD"]) == 0
@@ -384,6 +391,11 @@ def make_train(config):
             # Added logging for differnt analysis metrics.
             param_sparsity = utils.summarize_sparsity(train_state.params, only_total_sparsity=True)
             mask_sparsity = utils.summarize_sparsity(train_state.opt_state.masks, only_total_sparsity=True)
+            explored_params = jax.tree_util.tree_reduce(
+                jnp.add, jax.tree_util.tree_map(jnp.sum, cumulative_mask)
+            )
+            total_params = jax.tree_util.tree_reduce(jnp.add, jax.tree_util.tree_map(lambda x: x.size, train_state.opt_state.masks))
+            exploration_coefficient = explored_params / total_params
             metrics = {
                 "training/env_step": train_state.timesteps,
                 "training/update_steps": train_state.n_updates,
@@ -399,6 +411,7 @@ def make_train(config):
                 "target/QVarience": jnp.var(lambda_targets),
                 "sparsity/param_sparsity": param_sparsity['_total_sparsity'],
                 "sparsity/mask_sparsity": mask_sparsity['_total_sparsity'],
+                "sparsity/exploration_coefficient": exploration_coefficient,
                 "params/param_norm(l2)": optax.global_norm(train_state.params),
                 "grads/grad_norm(l2)": gn.mean(),
             }
@@ -439,7 +452,7 @@ def make_train(config):
                 # The call to the callback is also simpler, as analysis_metrics is now a single, top-level variable.
                 jax.debug.callback(callback, metrics, analysis_metrics, original_seed)
 
-            runner_state = (train_state, tuple(expl_state), test_metrics, rng)
+            runner_state = (train_state, tuple(expl_state), test_metrics, cumulative_mask, rng)
 
             return runner_state, metrics
 
@@ -449,7 +462,12 @@ def make_train(config):
         # train
         rng, _rng = jax.random.split(rng)
         expl_state = (init_obs, env_state)
-        runner_state = (train_state, expl_state, test_metrics, _rng)
+        
+        cumulative_mask_init = jax.tree_util.tree_map(
+            jnp.zeros_like, train_state.opt_state.masks
+        )
+
+        runner_state = (train_state, expl_state, test_metrics, cumulative_mask_init, _rng)
 
         runner_state, metrics = jax.lax.scan(
             _update_step, runner_state, None, config["NUM_UPDATES"]
