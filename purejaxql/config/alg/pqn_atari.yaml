@@ -38,15 +38,15 @@ PRUNER_KWARGS:
   start_step: 175000 # 157500 
   end_step: 625000  # for 200M 624000 
   sparsity_distribution: "erk"
-  drop_fraction: 0.3
+  drop_fraction: 0.5
 
 ANALYSIS_KWARGS:
   ANALYSIS_BATCH_PERIOD: 100
   ANALYSIS_SAMPLE_SIZE: 128
   srank_tau: 0.01
   srank_sample_size: 512
-  taus: [0.1, 0.01, 0.001, 0.0001, 0]
-  grama_taus: [0.1, 0.05, 0.001, 0]
+  taus: [0.1, 0.01, 0.001, 0.0001]
+  grama_taus: [0.1, 0.05, 0.001]
 
 # evaluation
 TEST_DURING_TRAINING: True 

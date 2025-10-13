@@ -1,0 +1,29 @@
+# sweep.yaml
+project: pqn_atari_sweep_atari5
+name: pqn_atari_sweep
+
+program: purejaxql/pqn_atari.py
+
+method: grid
+
+metric:
+  name: "test/return"
+  goal: maximize
+# values: ["BattleZone-v5", "DoubleDunk-v5", "NameThisGame-v5", "Phoenix-v5","Qbert-v5"]
+parameters:
+  alg.ENV_NAME:
+    values: ["BattleZone-v5", "DoubleDunk-v5", "NameThisGame-v5"]
+  alg.PRUNER_KWARGS.pruner:
+    values: ["set", "magnitude"]
+  alg.USE_LAYER_NORM:
+    values: [True]
+  SEED:
+    values: [0, 42, 123, 456, 789]   
+
+# Build the command explicitly (Hydra-style)
+command:
+  - ${env}
+  - python
+  - ${program}
+  - +alg=pqn_atari
+  - ${args_no_hyphens}

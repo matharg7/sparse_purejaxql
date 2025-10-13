@@ -25,7 +25,7 @@ def compute_q_estimation_norm(qvals: jnp.ndarray) -> float:
 def compute_parameter_l2(params) -> jnp.ndarray:
     return optax.global_norm(params)
 
-@partial(jax.jit, static_argnames=('apply_fn',))
+@partial(jax.jit)
 def compute_ranks_from_features_jax(feats: jnp.ndarray, tau: float) -> jnp.ndarray:
     feature_matrices = feats[jnp.newaxis, ...]
     threshold = 1.0 - tau

@@ -421,36 +421,39 @@ def make_train(config):
                 metrics.update({f"test/{k}": v.mean() for k, v in test_infos.items()})
 
             # report on wandb if required
-            if config["WANDB_MODE"] != "disabled":
+            # if config["WANDB_MODE"] != "disabled":
 
                 # The new, simplified callback
-                def callback(metrics, analysis_metrics, original_seed):
-                    # This part is unchanged
-                    if config.get("WANDB_LOG_ALL_SEEDS", False):
-                        metrics.update({f"rng{int(original_seed)}/{k}": v for k, v in metrics.items()})
-                    wandb.log(metrics)
+            def callback(metrics, analysis_metrics, original_seed):
+                # This part is unchanged
+                metrics = jax.tree_util.tree_map(np.asarray, metrics)
 
-                    # --- START OF CHANGES ---
+                if config.get("WANDB_LOG_ALL_SEEDS", False):
+                    metrics.update({f"rng{int(original_seed)}/{k}": v for k, v in metrics.items()})
+                wandb.log(metrics)
 
-                    # 1. No more complex reshaping or looping.
-                    # 2. A simple check to see if the analysis was run in this update.
-                    #    The dummy metric tree we created has srank=0, so this works perfectly.
-                    # print(analysis_metrics['ranks/srank_kumar'])
-                    if analysis_metrics['ranks/srank_kumar'] > 0:
+                # --- START OF CHANGES ---
 
-                        # 3. Restructure and log the single metric dictionary.
-                        restructured_log = analysis.restructure_single_step_metrics(analysis_metrics)
+                # 1. No more complex reshaping or looping.
+                # 2. A simple check to see if the analysis was run in this update.
+                #    The dummy metric tree we created has srank=0, so this works perfectly.
+                # print(analysis_metrics['ranks/srank_kumar'])
+                if analysis_metrics['ranks/srank_kumar'] > 0:
 
-                        final_log = {}
-                        for key, val in restructured_log.items():
-                            final_log[key] = val
+                    # 3. Restructure and log the single metric dictionary.
+                    restructured_log = analysis.restructure_single_step_metrics(analysis_metrics)
 
-                        # 4. Log against the current gradient step for consistent plotting.
-                        # final_log['training/grad_steps'] = metrics["training/grad_steps"]
-                        wandb.log(final_log)
+                    final_log = {}
+                    for key, val in restructured_log.items():
+                        final_log[key] = val
 
-                # The call to the callback is also simpler, as analysis_metrics is now a single, top-level variable.
-                jax.debug.callback(callback, metrics, analysis_metrics, original_seed)
+                    # 4. Log against the current gradient step for consistent plotting.
+                    # final_log['training/grad_steps'] = metrics["training/grad_steps"]
+                    final_log = jax.tree_util.tree_map(np.asarray, final_log)
+                    wandb.log(final_log)
+
+            # The call to the callback is also simpler, as analysis_metrics is now a single, top-level variable.
+            jax.debug.callback(callback, metrics, analysis_metrics, original_seed)
 
             runner_state = (train_state, tuple(expl_state), test_metrics, cumulative_mask, rng)
 
